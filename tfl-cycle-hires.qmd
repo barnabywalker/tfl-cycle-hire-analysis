@@ -1,0 +1,639 @@
+---
+title: "TFL cycle hire"
+author: "Barnaby Walker"
+format: html
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: libraries
+#| include: false
+
+library(xgboost)
+library(tidyverse)
+library(tidymodels)
+library(modeltime)
+library(lubridate)
+library(timetk)
+library(readxl)
+library(httr)
+library(sf)
+library(vip)
+```
+
+To try and get some practice forecasting time series, I thought I'd look at what data sets are available on the [London Datastore](https://data.london.gov.uk/).
+
+I found [this one](https://data.london.gov.uk/dataset/number-bicycle-hires), which is a spreadsheet of the number of hires in the TFL cycle hire scheme per day, month, and year.
+
+Reading the data in needs a little bit of wrangling - each period (daily, monthly, yearly) is in the same sheet in an Excel file, and there is some extra data aggregating the yearly changes under the yearly data.
+
+```{r}
+#| label: read-sheets
+
+daily_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range=cell_cols("A:B")) |>
+  mutate(Day=as_date(Day)) |>
+  rename("n"="Number of Bicycle Hires", "date"="Day")
+
+monthly_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range=cell_cols("D:E")) |>
+  mutate(Month=as_date(Month)) |>
+  rename("n"="Number of Bicycle Hires", "date"="Month")
+
+yearly_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range="G1:H13") |>
+  mutate(Year=parse_date(as.character(Year), format="%Y")) |>
+  rename("n"="Number of Bicycle Hires", "date"="Year")
+```
+
+Looking at these different time series already brings up some interesting features:
+
+```{r}
+#| label: plot-all-series
+
+daily_numbers |>
+  mutate(period="daily") |>
+  bind_rows(
+    monthly_numbers |> mutate(period="monthly")
+  ) |>
+  bind_rows(
+    yearly_numbers |> mutate(period="yearly")
+  ) |>
+  plot_time_series(date, n, .facet_vars=period, .smooth=FALSE,
+                   .title="TFL Bike hire numbers")
+```
+
+However, most of the interesting things, I think, are happening in the daily time series:
+
+-   There's fairly significant day-to-day variation in the number of hires.
+-   But there's some clear yearly seasonality, which also comes out in the monthly data, but also maybe some weekly and/or monthly seasonality.
+-   There's a dip in the number of hires in 2013 in the yearly data, which is also clear in the humps of the daily data.
+-   The effect of COVID is quite clear near the start of 2020, and then the number of hires rebounds quite significantly. The variation in the post-COVID data also looks higher, possibly due to different restrictions being imposed and removed.
+-   There's a very big spike on the 9th July 2015, which looking into the news at the time is because of a tube strike, which is nice to see.
+
+So the daily data looks more interesting to attempt to model and forecast, with the possibility of seeing what the effect of COVID and the ensuing restrictions had on cycle hire numbers.
+
+## TFL cycle hire scheme
+
+But first, a bit of context about the cycle hire scheme might help.
+
+As per [Wikipedia](https://en.wikipedia.org/wiki/Santander_Cycles), the TFL cycle hire scheme was originally proposed by Ken Livingstone and rolled out on 30th July 2010 by Boris Johnson.
+
+The bikes are intended for short trips - members of the public can hire a bike for 30 minutes at a time, or for 60 minutes with a monthly or annual membership. Originally, you had to be a member to hire the bikes, but from the 3rd December 2010 anyone could hire a bike for 30 mins from a docking station.
+
+All the docking stations are placed around inner London. When the scheme started, there were 5,000 bikes across 315 docking stations. There have since been a couple large expansions, and there are apparently now over 12,000 bikes at 800 stations.
+
+We can get the location and installation date for all of these stations from the [TFL API](https://api.tfl.gov.uk/swagger/ui/index.html?url=/swagger/docs/v1#!/BikePoint/BikePoint_GetAll).
+
+```{r}
+#| label: tfl-api
+
+tfl_url <- "https://api.tfl.gov.uk/BikePoint/"
+r <- GET(tfl_url)
+station_info <- content(r)
+
+parse_station_row <- function(row) {
+  tbl <- as_tibble_row(row[c("id", "commonName", "lat", "lon")])
+  additional <- map_dfr(row$additionalProperties, as_tibble_row)
+  additional <- 
+    additional |>
+    filter(key %in% c("NbDocks", "InstallDate", "RemovalDate")) |>
+    select(key, value) |>
+    pivot_wider(names_from="key", values_from="value")
+  
+  tbl |>
+    bind_cols(additional) |>
+    rename(name=commonName, installed=InstallDate, 
+           removed=RemovalDate, docks=NbDocks) |>
+    mutate(installed=as_datetime(as.numeric(installed) / 1000),
+           removed=as_datetime(as.numeric(removed) / 1000),
+           docks=as.numeric(docks))
+}
+
+station_tbl <- map_dfr(station_info, parse_station_row)
+n_active <- sum(!is.na(station_tbl$installed) & is.na(station_tbl$removed))
+
+glue::glue("{n_active} active docking stations out of {nrow(station_tbl)} listed.")
+```
+
+And we can look at where they are on a map.
+
+```{r map-stations, fig.height=6, fig.width=6, warning=FALSE, message=FALSE}
+#| label: map-stations
+#| fig.align: center
+#| fig.height: 6
+#| fig.width: 6
+
+boroughs <- st_read("data/statistical-gis-boundaries-london/ESRI/London_Borough_Excluding_MHW.shp", quiet=TRUE)
+
+station_tbl |>
+  st_as_sf(coords=c("lon", "lat"), crs="WGS84") |>
+  ggplot() +
+  geom_sf(data=filter(boroughs, ONS_INNER == "T")) +
+  geom_sf(mapping=aes(colour=installed)) +
+  scico::scale_colour_scico(palette="batlowK", name="installation date",
+                            labels=function(x) year(as_datetime(x))) +
+  guides(colour=guide_colorbar(
+    title.position="top",
+    barwidth=15,
+    barheight=1
+  )) +
+  theme_void() +
+  theme(legend.position="bottom")
+```
+
+Most docks are fairly central, with an extension to the east around 2012, an extension to the west around 2013/2014, and a spattering of smaller, more recent expansions.
+
+The date of expansions, and their impact on the number of docks is clearer if we plot the timeline of expansions.
+
+```{r}
+#| label: dock-history
+dock_history <-
+  station_tbl |>
+  select(installed, removed, docks) |>
+  pivot_longer(-docks, names_to="operation", values_to="date") |>
+  filter(!is.na(date)) |>
+  mutate(date=date(date)) |>
+  group_by(date, operation) |>
+  summarise(docks=sum(docks), stations=n(), .groups="drop") |>
+  pivot_longer(c(docks, stations), names_to="item", values_to="n") |>
+  pivot_wider(id_cols=c(date, item), names_from="operation", values_from="n") |>
+  replace_na(list(installed=0, removed=0)) |>
+  arrange(date) |>
+  mutate(change=installed - removed) |>
+  group_by(item) |>
+  mutate(total=cumsum(change)) |>
+  ungroup() |>
+  select(date, item, total) |>
+  pivot_wider(id_cols=date, names_from="item", values_from="total")
+
+p <- dock_history |>
+  ggplot(mapping=aes(x=date, y=stations)) +
+  geom_line(size=1) +
+  geom_point(mapping=aes(size=docks, colour=docks)) +
+  scico::scale_color_scico() +
+  guides(colour="none") +
+  theme(legend.position="bottom")
+
+plotly::ggplotly(p) |> plotly::layout(showlegend=TRUE)
+```
+
+The number of docks is almost the same as the number of available bikes (give or take any docks that are unavailable for any reason). An increase in the number of available bikes, especially in new areas, could explain any increase in the number of hires and mask any other long term usage trends.
+
+It might be better to look at the number of hires per dock - increasing useage by adding more docking stations is good, but at some point it might stop being cost-effective if the number of hires per dock drops.
+
+```{r}
+#| label: hires-per-dock
+
+daily_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range=cell_cols("A:B"))
+
+d <-
+  daily_numbers |>
+  mutate(Day=as_date(Day)) |>
+  rename("n"="Number of Bicycle Hires", "date"="Day") |>
+  left_join(
+    dock_history |>
+    complete(date=seq.Date(min(date), max(date), by="day")) |>
+    fill(docks, stations, .direction="down"), 
+  by="date") |>
+  mutate(neff=n / docks)
+
+d |>
+  select(-docks, -stations) |>
+  pivot_longer(-date) |>
+  mutate(name=recode(name, n="Number of hires", neff="Number of hires per dock")) |>
+  plot_time_series(date, value, .facet_vars=c(name), 
+                   .title="Daily TFL cycle hires")
+```
+
+If we looked at just the daily number of hires, we might think that the hire scheme is more popular than ever. We might also think that 2013 was an unusually bad year. However, the number of hires per dock looks like it's trending downwards each year, with a possible increase in popularity after COVID. In this context, 2013 doesn't look unusual at all.
+
+So, I'll try to model and forecast the daily number of hires per dock.
+
+## Preparing the data for forecasting
+
+Before trying to model the number of daily hires per dock, I need to prepare the data.
+
+As a first attempt, I'll focus on forecasting the pre-COVID data because the post-COVID data (especially the variance) looks at bit different. As an easy cutoff, I'll remove everything after the start of 2020.
+
+I'll also remove anything before 2011, as the scheme only started for members at the end of July 2010 and opened to all the public in December 2010.
+
+```{r}
+#| label: define-date-range
+
+d <- filter(d, date >= ymd("2011-01-01"))
+
+pre2020_raw <- filter(d, date < ymd("2020-01-01"))
+post2020_raw <- filter(d, date >= ymd("2020-01-01"))
+```
+
+We also need to split the data into training and test sets. For time series, this isn't done randomly (because the observations are correlated) but we'll take the most recent 10 % of observations as the test set.
+
+```{r}
+#| label: data-budget
+splits <- initial_time_split(pre2020_raw, prop=0.9)
+```
+
+Next, we'll define the pre-processing steps. Most of the time series models I'll try use the date directly as the predictor but I'll give a machine learning model a go as well, and for that we need to do some feature engineering to create features from the date of each observation.
+
+The steps of the pre-processing recipe will:
+
+-   Remove any variables we aren't interested in.
+-   Extract a set of features derived from the date of the observations, like the day of the week, the week within the year, the month of the year, the year, etc.
+-   Create features indicating if the observations fall on any holidays.
+-   Center and scale the date index feature we created because it is the number of seconds since 1970, which is a very big number.
+-   One-hot encode any categorical features we created (like the month).
+
+```{r}
+#| label: define-preprocess
+
+rec <- recipe(neff ~ ., data=pre2020_raw) |>
+  step_rm(n) |>
+  step_timeseries_signature(date) |>
+  step_holiday_signature(date, holiday_pattern="^(World|GB)_", 
+                         locale_set=c("World", "GB"), exchange_set="LONDON") |>
+  step_normalize(date_index.num) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+```
+
+Once we've defined the pre-processing recipe, we prepare it using the training data (to prevent data leakage) and transform each of our data sets with it.
+
+```{r}
+#| label: preprocess
+prepped <- prep(rec, training(splits))
+train <- bake(prepped, new_data=NULL)
+test <- bake(prepped, new_data=testing(splits))
+post2020 <- bake(prepped, new_data=post2020_raw)
+```
+
+And we're ready for forecasting!
+
+## A first attempt at forecasting
+
+I'll try out a few different methods for modelling the pre-COVID data:
+
+-   **Exponential smoothing**: a statistical method where each observation is forecast as the weighted average of all previous observations, where the weights decrease exponentially the further into the past we get. Trends and seasonality can be modelled using additional smoothing equations. In the implementation I'm using, the best fitting trend and seasonality equations are automatically selected.
+
+```{r}
+#| label: ets-model1
+
+model_ets <- exp_smoothing() |>
+  set_engine("ets") |>
+  fit(neff ~ date, data=train)
+```
+
+-   **Auto-regressive integrated moving average (ARIMA)**: a statistical model combining an a regression where the terms are a linear combination of all previous observations (autoregression), differencing the data from the data shifted in time by a particular period, and a regression where the terms are a linear combination of the past forecast errors (moving average model). Seasonality can be incorporated by the addition of autoregressive, differencing, and moving average components that use back-shifts for the seasonal period. In the implementation I'm using, the order of each component and the seasonality are automatically selected.
+
+```{r}
+#| label: arima-model1
+
+model_arima <- arima_reg() |>
+  set_engine("auto_arima") |>
+  fit(neff ~ date, train)
+```
+
+-   **Prophet**: a more modern statistical model introduced by Facebook that applies a non-linear regression comprising a piece-wise linear trend, Fourier terms for seasonal periods, and holidays as binary variables. The model is fit using Bayesian sampling.
+
+```{r}
+#| label: prophet-model1
+
+model_prophet <- prophet_reg(
+  seasonality_week=TRUE
+) |>
+  set_engine("prophet") |>
+  fit(neff ~ date, data=train)
+```
+
+-   **ARIMA with XGBoost errors**: an ARIMA model with an XGBoost model fit to the error terms. XGBoost is a popular implementation of gradient boosting, a tree-based machine learning model where an ensemble of small trees are fit iteratively to the residuals of the previous fit. The implementation I'm using automatically selects the best ARIMA model. I'm simplifying things a bit by not tuning the hyperparameters of the XGBoost model.
+
+```{r}
+#| label: arima-xgboost-model1
+
+model_arima_boost <- arima_boost(
+  min_n=2,
+  learn_rate=0.015
+) |>
+  set_engine("auto_arima_xgboost") |>
+  fit(neff ~ date + date_index.num + date_month,
+      data=train)
+```
+
+-   **XGBoost**: just fitting an XGBoost model to some of the features we created in our pre-processing timeline. I don't think all those features are relevant, and some (like the date index) might be prone to overfitting, so I've picked a few that I think make sense.
+
+```{r}
+#| label: xgboost-model1
+
+boost_preds <- c(
+  "date_year", # to capture any year-on-year trend
+  "date_month", # yearly seasonality because of the month, e.g. summer
+  "date_wday", # weekly seasonality, e.g. people taking a ride at the weekend
+  "date_week", # yearly seasonality with shorter periods, e.g. school holidays
+  "date_World_ChristmasDay",
+  "date_World_ChristmasEve",
+  "date_World_BoxingDay",
+  "date_World_NewYearsDay",
+  "date_World_GoodFriday",
+  "date_World_EasterSunday",
+  "date_World_EasterMonday",
+  "date_GB_SummerBankHoliday",
+  "date_GB_MayDay",
+  "date_GB_BankHoliday",
+  "date_exch_LONDON" # when the london stock exchange is shut, for business closures
+)
+
+boost_form <- formula(paste0("neff ~ ", paste0(boost_preds, collapse=" + ")))
+model_boost <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression") |>
+  fit(boost_form, train)
+```
+
+The [*modeltime*](https://business-science.github.io/modeltime/)package I'm using lets me put all the models together in a table, which makes evaluating and comparing the models easier
+
+```{r}
+#| label: model-table1
+model_tbl <- 
+  modeltime_table(
+    model_ets,
+    model_arima,
+    model_prophet,
+    model_arima_boost,
+    model_boost
+  )
+```
+
+### Assessing the forecasts
+
+We assess the models by making forecasts for our held-out test set and measuring how much the forecast agrees with the observed daily hires per dock.
+
+```{r}
+#| label:  evaluate1
+
+cb_tbl <- modeltime_calibrate(
+  model_tbl,
+  new_data=test,
+  quiet=FALSE
+)
+
+cb_tbl |>
+  modeltime_accuracy(metric_set=extended_forecast_accuracy_metric_set()) |>
+  table_modeltime_accuracy(
+    .interactive=FALSE
+  )
+```
+
+There are a few different metrics in the evaluation table, but the ones I'm most interested in are the mean absolute error (MAE) and the R-squared. The XGBoost and Prophet models are the best performing, despite Prophet often not working much better than exponential smoothing. Even though they're the best fitting models, both have quite high MAE and only explain around half the variance in the data.
+
+```{r}
+#| label:  forecast1
+
+cb_tbl |>
+  modeltime_forecast(
+    new_data=test,
+    actual_data=filter(pre2020_raw, date >= ymd("2018-01-01"))
+  ) |>
+  plot_modeltime_forecast(
+    .legend_max_width=25,
+    .interactive=TRUE
+  )
+```
+
+Looking at the forecasts, we can see that neither XGBoost or Prophet are perfect but they both appear to capture the short and longer-term seasonality in the data well. It's likely that I could have got better results from exponential smoothing and ARIMA with a bit more effort and digging in to their nuts and bolts, but XGBoost and Prophet have worked surprisingly well "off the shelf".
+
+### Identifying trends
+
+As the Prophet model has components for different seasonality periods, we can decompose the forecast to get an idea of the trend and recurring patterns in our model.
+
+```{r}
+#| label: prophet-components
+
+prophet_fit <- model_tbl$.model[[3]]$fit$models$model_1
+
+forecast_tbl <- prophet::make_future_dataframe(prophet_fit, periods=366)
+forecast <- predict(prophet_fit, forecast_tbl)
+prophet::prophet_plot_components(prophet_fit, forecast)
+```
+
+From this, it looks like when the scheme started there were an average of over 2 hires per bike a day but after the two major expansions, this decreased to just over 1.6 hires per bike a day. Since 2014, the trend has been a slow decrease in the number of hires per bike per day.
+
+The weekly seasonality reveals a fairly strong weekend effect but the opposite of what I expected - there are fewer hires per bike at the weekend, suggesting a major driver of bike hires is people using them for part or all of their commutes.
+
+And the yearly seasonality shows the peak usage in the summer months, aligning with nicer weather.
+
+Even though we haven't directly input seasonality or trends into the XGBoost model, we can take a look at how it's using the features we created to see how it's using them. Our first port of call is to look at which features are most important to the model.
+
+```{r}
+#| label: xgboost-importance1
+
+xgboost_fit <- model_tbl$.model[[5]]
+importance <- vi(xgboost_fit)
+vip(xgboost_fit)
+```
+
+For the XGBoost model, the week of the year gives the biggest gain in performance, followed by the year, then the month and the weekday. All of the holiday features have much less importance - maybe not so surprising since they only give improvement for a single day.
+
+This tells us which features are most important for performance but not how they influence our forecast. To get that, we need to calculate the partial dependence of the features. This gives the effect of each feature if all the others are held constant.
+
+```{r}
+#| label: xgboost-pdp1
+
+make_pdp <- function(feat_name) {
+  pred_fun <- function(object, newdata) predict(object, new_data=newdata)
+  
+  pdata <- pdp::partial(xgboost_fit, pred.var=feat_name, train=train, 
+                        type="regression", pred.fun=pred_fun)
+  pdata |>
+    as_tibble() |>
+    rename("value"=feat_name) |>
+    mutate(feature=feat_name) |>
+    group_by(feature, value) |>
+    ggdist::median_qi(.width=c(0.69, 0.87, 0.95))
+    
+}
+
+pdp_data <- map_dfr(importance$Variable[1:10], make_pdp)
+
+pdp_data |>
+  mutate(feature=factor(feature, levels=importance$Variable[1:10])) |>
+  ggplot(mapping=aes(x=value, y=yhat, ymin=.lower, ymax=.upper)) + 
+  ggdist::geom_lineribbon(show.legend=FALSE) + 
+  scale_fill_brewer(palette="Greys") +
+  facet_wrap(~feature, scales="free_x") +
+  labs(x="", y="Number of cycle hires")
+```
+
+The first few partial dependence plots look very similar to the Prophet components, with added information about the effect of our holiday features. I found it pretty interesting that there's an uptick in people using the cycle hires on Christmas day.
+
+## Forecasting post-COVID data
+
+Now let's try and incorporate the post-COVID data.
+
+To account for changing behaviours, we'll add in a binary pre/post-COVID feature and some info on the timings of different lockdown restrictions that I got from the [London Datastore](https://data.london.gov.uk/dataset/covid-19-restrictions-timeseries)
+
+```{r}
+#| label: lockdown-info
+
+lockdowns <- read_csv("data/restrictions_daily.csv",
+                      col_types=cols(date=col_date("%d/%m/%Y"))) |>
+  filter(!is.na(date)) |>
+  rename_with(~paste0("lockdown_", .x), -date) |>
+  mutate(postcovid=1)
+
+d <- 
+  d |>
+  left_join(lockdowns, by="date") |>
+  mutate(across(starts_with("lockdown_"), replace_na, 0)) |>
+  replace_na(list(postcovid=0))
+```
+
+With these new features we need to resplit our data so our training set incorporates some time post-COVID and we need to update our pre-processing.
+
+```{r}
+#| label: update-processing
+
+splits <- initial_time_split(d, prop=0.85)
+
+rec <- recipe(neff ~ ., data=d) |>
+  step_timeseries_signature(date) |>
+  step_holiday_signature(date, holiday_pattern="^(World|GB)_", 
+                         locale_set=c("World", "GB"), exchange_set="LONDON") |>
+  step_normalize(date_index.num) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>
+  step_rm(n)
+
+prepped <- prep(rec, training(splits))
+train <- bake(prepped, new_data=NULL)
+test <- bake(prepped, new_data=testing(splits))
+```
+
+This time, I'll only use the XGBoost and Prophet models. Adding these new features to the XGBoost model is fairly trivial. It's also possible to add them to the Prophet model, but a bit more involved, so I'll only use the Prophet model as a baseline.
+
+```{r}
+#| label: model-table2
+boost_preds <- c(
+  boost_preds,
+  "postcovid",
+  "lockdown_schools_closed",                
+  "lockdown_pubs_closed",                  
+  "lockdown_shops_closed",                   
+  "lockdown_eating_places_closed",
+  "lockdown_stay_at_home",
+  "lockdown_household_mixing_indoors_banned",
+  "lockdown_wfh",
+  "lockdown_rule_of_6_indoors",
+  "lockdown_curfew",             
+  "lockdown_eat_out_to_help_out"
+)
+
+boost_form <- formula(paste0("neff ~ ", paste0(boost_preds, collapse=" + ")))
+model_boost <- boost_tree() |>
+  set_engine("xgboost") |>
+  set_mode("regression") |>
+  fit(boost_form, select(train, -date))
+
+model_prophet <- prophet_reg(
+  seasonality_week=TRUE
+) |>
+  set_engine("prophet") |>
+  fit(neff ~ date, data=train)
+
+model_tbl <- 
+  modeltime_table(
+    model_boost,
+    model_prophet
+  )
+
+```
+
+### Assessing the forecasts
+
+```{r}
+#| label: evaluate2
+
+cb_tbl <- modeltime_calibrate(
+  model_tbl,
+  new_data=test,
+  quiet=FALSE
+)
+
+cb_tbl |>
+  modeltime_accuracy(metric_set=extended_forecast_accuracy_metric_set()) |>
+  table_modeltime_accuracy(
+    .interactive=FALSE
+  )
+```
+
+The performance of both models is worse than for just the pre-COVID data, but the XGBoost model is definitely better than the Prophet model without any info about lockdown restrictions.
+
+```{r}
+#| label: forecast2
+
+cb_tbl |>
+  modeltime_forecast(
+    new_data=test,
+    actual_data=filter(d, date >= ymd("2018-01-01"))
+  ) |>
+  plot_modeltime_forecast(
+    .legend_max_width=25,
+    .interactive=TRUE
+  )
+```
+
+Looking at the forecast shows this, but it also shows the XGBoost underpredicting quite badly in a few regions.
+
+But it might still be useful for looking at the impact of COVID and the ensuing restrictions on the daily hire activity...
+
+### Looking at the impact of COVID
+
+We'll start with the XGBoost feature importance.
+
+```{r}
+#| label: xgboost-importance2
+
+xgboost_fit <- model_tbl$.model[[1]]
+importance <- vi(xgboost_fit)
+vip(xgboost_fit)
+
+```
+
+The top 4 feature are the same as before, but this time the working from home mandate is the 5th most important feature.
+
+Now we'll look at the partial dependence plots to see the effect of these features.
+
+```{r}
+#| label: xgboost-pdp2
+
+pdp_data <- map_dfr(importance$Variable[1:10], make_pdp)
+
+pdp_data |>
+  mutate(feature=factor(feature, levels=importance$Variable[1:10])) |>
+  ggplot(mapping=aes(x=value, y=yhat, ymin=.lower, ymax=.upper)) + 
+  ggdist::geom_lineribbon(show.legend=FALSE) +
+  scale_fill_brewer(palette="Greys") +
+  facet_wrap(~feature, scales="free_x") +
+  labs(x="", y="Number of cycle hires")
+```
+
+The trends and seasonality look about the same, but now the lockdown restrictions are reducing the number of daily hires per bike a bit.
+
+## Final thoughts and possible improvements
+
+As a modelling exercise, this has been semi-successful. I was able to glean some findings from the forecasts, like:
+
+-   Weekends are less popular for hiring bikes.
+-   There's a spike in activity on Christmas day.
+-   Lockdown restrictions reduced hiring activity, with the work from home mandate having the biggest effect.
+
+But the model forecasting post-COVID data didn't fit that well, and it's clear looking at the forecast it doesn't capture the variation in the data very well.
+
+If I were to take this further, I'd probably try:
+
+-   Adding the holidays and lockdown restrictions to the Prophet model to see if it did any better.
+-   Tuning the hyperparameters of the XGBoost model.
+-   Incorporating information about transport strike days, which clearly have a large effect on single days.
+-   Incorporating weather data - people would probably decide not to cycle when it's raining or too cold.
+-   Adding info about the rollout of other cycle and e-scooter hire schemes, like Lime.

@@ -1,0 +1,59 @@
+---
+title: "TFL cycle hire analysis"
+format: gfm
+editor: visual
+---
+
+This repository contains a quick analysis of daily hires from the TFL cycle hire scheme, as a way for me to learn a bit more about time series analysis.
+
+I downloaded the cycle hire data from the [London Datastore](https://data.london.gov.uk/dataset/number-bicycle-hires) and analysed it alongside some info on the number of docking stations from the [TFL API](https://api.tfl.gov.uk/swagger/ui/index.html?url=/swagger/docs/v1#!/BikePoint/BikePoint_GetAll) and [a time series of COVID restrictions in London](https://data.london.gov.uk/dataset/covid-19-restrictions-timeseries).
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+
+
+daily_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range=cell_cols("A:B")) |>
+  mutate(Day=as_date(Day)) |>
+  rename("n"="Number of Bicycle Hires", "date"="Day")
+
+monthly_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range=cell_cols("D:E")) |>
+  mutate(Month=as_date(Month)) |>
+  rename("n"="Number of Bicycle Hires", "date"="Month")
+
+yearly_numbers <- read_xlsx("data/tfl-daily-cycle-hires.xlsx", sheet="Data", 
+                           range="G1:H13") |>
+  mutate(Year=parse_date(as.character(Year), format="%Y")) |>
+  rename("n"="Number of Bicycle Hires", "date"="Year")
+
+daily_numbers |>
+  mutate(period="daily") |>
+  bind_rows(
+    monthly_numbers |> mutate(period="monthly")
+  ) |>
+  bind_rows(
+    yearly_numbers |> mutate(period="yearly")
+  ) |>
+  ggplot(mapping=aes(x=date, y=n, colour=period)) +
+  geom_line(show.legend=FALSE, size=1) +
+  scale_y_continuous(labels=scales::label_number_si()) +
+  scale_x_date(expand=c(0,0)) +
+  facet_wrap(~period, ncol=1, scales="free_y") +
+  labs(x="", y="", title="TFL bike hire numbers") +
+  theme_bw() +
+  theme(
+    strip.background=element_rect(fill="#27285C"),
+    panel.border=element_rect(colour="#27285C"),
+    strip.text=element_text(colour="#ffffff", face="bold"),
+    text=element_text(colour="#27285C"),
+    axis.text=element_text(colour="#27285C"),
+    axis.ticks=element_line(colour="#27285C")
+   )
+```
