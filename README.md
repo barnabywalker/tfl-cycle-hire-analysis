@@ -5,6 +5,9 @@ This repository contains a quick analysis of daily hires from the TFL
 cycle hire scheme, as a way for me to learn a bit more about time series
 analysis.
 
+You can take a look at the analysis here:
+[barnabywalker.github.io/tfl-cycle-hire-analysis](https://barnabywalker.github.io/tfl-cycle-hire-analysis/)
+
 I downloaded the cycle hire data from the [London
 Datastore](https://data.london.gov.uk/dataset/number-bicycle-hires) and
 analysed it alongside some info on the number of docking stations from
@@ -13,4 +16,4 @@ API](https://api.tfl.gov.uk/swagger/ui/index.html?url=/swagger/docs/v1#!/BikePoi
 and [a time series of COVID restrictions in
 London](https://data.london.gov.uk/dataset/covid-19-restrictions-timeseries).
 
-![](README_files/figure-gfm/unnamed-chunk-1-1.png)
+![](README_files/figure-gfm/daily-hires-plot-1.png)
